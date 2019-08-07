@@ -1,20 +1,66 @@
 local JSON = dofile("apis/dkjson")
 
--- Build a github API url, trying to authenticate (not tested)
-local auth
-local function getAPI(path)
-	local url
-	if auth and auth.type == 'basic' then
-		url = ('https://%s:%s@api.github.com/%s'):format(auth.user, auth.pass, path)
-	else
-		url = ('https://api.github.com/%s'):format(path)
+-- Build a github API url, with authorization headers.
+local function getAPI(path, auth)
+	local url = ('https://api.github.com/%s'):format(path)
+	local headers
+	if auth and auth.type == 'oauth' then
+		headers = { ['Authorization'] = ('token %s'):format(auth.token) }
 	end
-	local req = http.get(url)
+	local req = http.get(url, headers)
 	if req then
-		return JSON.decode(req.readAll())
+		return req.getResponseCode(), JSON.decode(req.readAll())
 	else
-		error('Could not get github API from ' ..path)
+		return nil, {}
 	end
+end
+
+local function encodeURI(s)
+	return s:gsub(' ', '%20')
+end
+
+-- A class for authorization
+local authFile = '.github-auth'
+local function writeAuth(data)
+	f = fs.open(authFile, 'w')
+	f.write(textutils.serialize(data))
+	f.close()
+end
+local function getAuthTable()
+	local authTable = {}
+	if fs.exists(authFile) then
+		f = fs.open(authFile, 'r')
+		authTable = textutils.unserialize(f.readAll())
+		f.close()
+	end
+	return authTable
+end
+local Auth = {}
+Auth.__index = Auth
+Auth.new = function(type, user, token)
+	return setmetatable({type=type, user=user, token=token}, Auth)
+end
+Auth.get = function(user)
+	local authTable = getAuthTable()
+	local auth = authTable[user]
+	if auth then
+		auth = Auth.new(auth.type, auth.user, auth.token)
+	end
+	return auth
+end
+Auth.checkToken = function(self)
+	local status, request = getAPI('user', self)
+	return status == 200
+end
+Auth.save = function(self)
+	local authTable = getAuthTable()
+	authTable[self.user] = self
+	writeAuth(authTable)
+end
+Auth.delete = function(user)
+	local authTable = getAuthTable()
+	authTable[user] = nil
+	writeAuth(authTable)
 end
 
 -- A class for a blob (aka a file)
@@ -35,9 +81,11 @@ end
 local Tree = {}
 Tree.__index = Tree
 Tree.new = function(repo, sha, path)
-	local data = getAPI(
-		('repos/%s/%s/git/trees/%s'):format(repo.user, repo.name, sha)
-	)
+	local url = ('repos/%s/%s/git/trees/%s'):format(repo.user, repo.name, sha)
+	local status, data = getAPI(url, repo.auth)
+	if not status then
+		error('Could not get github API from ' ..url)
+	end
 	if data.tree then
 		local tree = setmetatable({
 			repo=repo, sha=data.sha,
@@ -78,14 +126,41 @@ Tree.iter = function(self)
 		walkTree(self, 0)
 	end)
 end
+Tree.cloneTo = function(self, dest, onProgress)
+	if not fs.exists(dest) then
+		fs.makeDir(dest)
+	elseif not fs.isDir(dest) then
+		return error("Destination is a file!")
+	end
+
+	for item in self:iter() do
+		local gitpath = item:fullPath()
+		local path = fs.combine(dest, gitpath)
+		if getmetatable(item) == Tree then
+			fs.makeDir(path)
+		elseif getmetatable(item) == Blob then
+			local data = http.get(
+				('https://raw.github.com/%s/%s/%s/%s'):format(
+					self.repo.user, self.repo.name, self.sha,
+					encodeURI(gitpath)
+				)
+			)
+			local h = fs.open(path, 'w')
+			local text = data.readAll()
+			h.write(text)
+			h.close()
+		end
+		if onProgress then onProgress(item) end
+	end
+end
 Tree.fullPath = Blob.fullPath
 
 -- A class for a repository
 local __repoPriv = setmetatable({}, {mode='k'})
 local Repository = {}
 Repository.__index = Repository
-Repository.new = function(user, name)
-	local r = setmetatable({user=user, name=name}, Repository)
+Repository.new = function(user, name, auth)
+	local r = setmetatable({user=user, name=name, auth=auth}, Repository)
 	__repoPriv[r] = {trees={}}
 	return r
 end
@@ -96,40 +171,13 @@ Repository.tree = function(self, sha)
 	end
 	return __repoPriv[self].trees[sha]
 end
-Repository.cloneTo = function(self, dest, onProgress)
-	if not fs.exists(dest) then
-		fs.makeDir(dest)
-	elseif not fs.isDir(dest) then
-		return error("Destination is a file!")
-	end
-
-	for item in self:tree('master'):iter() do
-		local gitpath = item:fullPath()
-		local path = fs.combine(dest, gitpath)
-		if getmetatable(item) == Tree then
-			fs.makeDir(path)
-		elseif getmetatable(item) == Blob then
-			local data = http.get(
-				('https://raw.github.com/%s/%s/master/%s')
-					:format(self.user, self.name, gitpath)
-			)
-			local h = fs.open(path, 'w')
-			local text = data.readAll()
-			h.write(text)
-			h.close()
-		end
-		if onProgress then onProgress(item) end
-	end
-end
 Repository.__tostring = function(self) return ("Repo@%s/%s"):format(self.user, self.name) end
 
 -- Export members
 local github = {}
-github.basicAuth = function(user, pass)
-	auth = {type='basic', user=user, pass=pass}
-end
 github.Repository = Repository
 github.Blob = Blob
 github.Tree = Tree
+github.Auth = Auth
 github.repo = Repository.new
 return github
